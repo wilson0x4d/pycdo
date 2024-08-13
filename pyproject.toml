@@ -1,0 +1,14 @@
+[tool.poetry]
+package-mode = false
+description = "A pycfile deobfuscation tool."
+authors = ["Shaun Wilson <mrshaunwilson@msn.com>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+watchdog = "^4.0.2"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

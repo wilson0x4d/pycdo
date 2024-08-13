@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: © 2024 Shaun Wilson
+# SPDX-License-Identifier: MIT
+#
+# default.pycrules
+#
+# Serves as an example .pycrules file for
+# `pycdo` tool, should allow an unbfuscated pyc
+# to pass through `pycdo` successfully and still
+# decompile in another tool afterward.
+#
+# you can modify it to fit your particular
+# needs.
+##
+
+import opcode
+
+def is_compatible(input:bytearray) -> bool:
+    if input.startswith(b'\xA7\x0D\x0D\x0A'):
+        # unobfuscated header matching Python 3.11
+        return True
+    return False
+
+def get_opcode_size() -> int:
+    """Informs the mapper of the opcode size for naive opcode extraction.
+
+    This will almost certainly be `1`.
+    """
+    return 1
+
+def inprocess(input:bytearray, output:bytearray) -> dict:
+    """Executed before any other mapping operations take place.
+
+    Must return a dict containing a 'header_size' entry that
+    indicates the length of the pyc header, since some
+    obfuscators appear to tamper with the header, and,
+    knowing precisely how to interpret the header from different
+    python versions would only complicate the pycdo code.
+    """
+    # extract header details
+    # https://peps.python.org/pep-0552/
+    result = {}
+    rdi = 0
+    result['magic'] = input[rdi:rdi+4]
+    rdi = 4
+    # python >3.7
+    result['flags'] = int.from_bytes(input[rdi:rdi+4], 'little')
+    rdi += 4
+    if result['flags'] & 1:
+        result['sip_hash'] = input[rdi:rdi+8]
+        rdi += 8
+    else: # or if python <3.7
+        result['timestamp'] = int.from_bytes(input[rdi:rdi+4], 'little')
+        rdi += 4
+        # python >3.3
+        result['marsh_size'] = int.from_bytes(input[rdi:rdi+4], 'little')
+        rdi += 4
+    # emit required values
+    ver_major = 3
+    ver_minor = 11
+    result['header_size'] = rdi
+    result['version'] = (ver_major * 100) + ver_minor
+    return result
+
+def outprocess(input:bytearray, output:bytearray) -> int:
+    """Executed after all other mapping operations have taken place.
+    
+    Must return the length of data to be stored from output buffer, which
+    would normally be the entire buffer, but in some rare cases `outprocess()`
+    may do some heavy rewriting that causes the overall length to change. For
+    example, fixing a tampered/corrupted pyc header."""
+    return len(output)
+
+def preprocess(input:bytearray, output:bytearray, index:int) -> int | None:
+    """Executed before each mapping operation is performed.
+
+    May (optionally) return a new bytecode index, causing
+    the mapping to skip to the indicated offset without
+    any further processing.
+
+    Return `-1` to exit the mapping process entirely (early exit).
+    """
+    pass
+
+def postprocess(input:bytearray, output:bytearray, index:int) -> int | None:
+    """Executed after each mapping operation is performed.
+
+    Should (preferentially) return a new bytecode index, causing
+    the mapping to continue at the indicated offset. This
+    is a preferential behavior because the size of a given
+    operation (including args) is version dependent, and,
+    may have been obfuscated in a way that the mapper can't
+    (shouldn't) make assumptions about the bytecode.
+
+    When return `None` the mapper will advance len(opcode) as
+    a Naive behavior to ensure the mapper does not deadlock.
+
+    Return `-1` to exit the mapping process entirely (early exit).
+    """
+    pass
+
+def get_subst_mapper(typecode, mod, offset):
+    """This allows a pycrules file to (optionally) provide a 'substitute mapper' to be used by PycReader based on the received state."""
+    pass
+
+def get_opcode_map() -> dict:
+    """This gets the 'expected' opcode map, as would be returned by 'opcode.opmap'.
+    
+    This is only used as a debugging aid, and 'None' can be returned if you're not relying on it.
+    
+    This is useful when the opmap of the target python differs from the opmap of your runtime python."""
+    return opcode.opmap
+
+def get_opcode_remap() -> dict:
+    """This gets the 'remapped' opcode map, ie. what you want each opcode to translate into.
+    
+    Each KEY is the opcode to remap, as a `bytes` value.
+
+    Each VALUE is a `dict` with the format:
+    {
+        'o': b'\\x0A', # the opcode bytes to replace with
+        'i': 1 # the increment to be applied by the mapper
+    }
+    OR:
+    Each VALUE is a `bytes` for direct replacement, in this mode the opcode size is inferred from the python version set via `inprocess()`.
+    """
+    return {
+        # dummy example,
+        b'\x00': {
+            'o': b'\x00',
+            'i': None
+        }
+    }
+
+def get_typecode_map() -> dict:
+    """Similar to get_opcode_map() this is a debugging aid."""
+    return {
+        'TYPE_NULL': 0,
+        'TYPE_NONE': ord('N'),
+        'TYPE_FALSE': ord('F'),
+        'TYPE_TRUE': ord('T'),
+        'TYPE_STOPITER': ord('S'),
+        'TYPE_ELLIPSIS': ord('.'),
+        'TYPE_INT': ord('i'),
+        'TYPE_INT64': ord('I'),
+        'TYPE_FLOAT': ord('f'),
+        'TYPE_BINARY_FLOAT': ord('g'),
+        'TYPE_COMPLEX': ord('x'),
+        'TYPE_BINARY_COMPLEX': ord('y'),
+        'TYPE_LONG': ord('l'),
+        'TYPE_STRING': ord('s'),
+        'TYPE_INTERNED': ord('t'),
+        'TYPE_REF': ord('r'),
+        'TYPE_TUPLE': ord('('),
+        'TYPE_LIST': ord('['),
+        'TYPE_DICT': ord('{'),
+        'TYPE_CODE': ord('c'),
+        'TYPE_UNICODE': ord('u'),
+        'TYPE_UNKNOWN': ord('?'),
+        'TYPE_SET': ord('<'),
+        'TYPE_FROZENSET': ord('>'),
+        'FLAG_REF': ord('\x80'),
+        'TYPE_ASCII': ord('a'),
+        'TYPE_ASCII_INTERNED': ord('A'),
+        'TYPE_SMALL_TUPLE': ord(')'),
+        'TYPE_SHORT_ASCII': ord('z'),
+        'TYPE_SHORT_ASCII_INTERNED': ord('Z'),
+    }
+
+def get_typecode_remap() -> dict:
+    """This gets the 'remapped' type map, ie. what you want each type code to translate into.
+    
+    Each KEY is the type code to remap.
+
+    Each VALUE is a dict with the format:
+    {
+        # the typecode byte(s) to replace with
+        't': b'\x0A',
+        # the increment to be applied by the mapper
+        'i': 1
+    }
+    """
+    return {
+        # empty
+    }

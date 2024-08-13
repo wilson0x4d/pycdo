@@ -1,0 +1,943 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: © 2024 Shaun Wilson
+# SPDX-License-Identifier: MIT
+#
+# A python script for deobfuscating pyc files (er go `pycdo`).
+##
+from enum import IntEnum
+import importlib
+import importlib.util
+import importlib.machinery
+import io
+from logging import Logger
+import os
+import struct
+import sys
+
+_log = Logger(__name__)
+
+__semver:str = '0.0.1' # TODO: semver expansion during 'build' or 'publish'
+
+class Trace:
+    _debug_level = 0
+    _trace_indent = 0
+    def set_level(self, level:int):
+        self._debug_level = level
+    def down(self):
+        self._trace_indent = self._trace_indent + 1
+    def msg(self, msg:str, level:bool|None = None):
+        if None is level:
+            level = self._trace_indent
+        if level <= self._debug_level:
+            print(f'{" " * (self._trace_indent * 4)}{msg}')
+    def up(self):
+        self._trace_indent = self._trace_indent - 1
+_trace = Trace()
+
+def print_version():
+    print(f'pycdo v{__semver} © Shaun Wilson, MIT License')
+
+def print_help():
+    print("""
+    Usage:
+          pycdo [--rules <rules-file>] <input-file> <output-file> [--force] 
+
+    Options:
+          --rules <rules-file>
+                    Indicates 'pycrules' file to use.
+                    (defaults to `./default.pycrules`)
+          --force   If <output-file> existsm, overwrite it.
+          --watch <command>
+                    Watches <rules-file> for changes,
+                    and runs <command> whenever the file
+                    changes.
+          <input-file>
+                    Required path to input '.pyc' file.
+          <output-file>
+                    Required path to ouput '.pyc' file.
+    """)
+
+def report_cli_unrecognized(arg:str):
+    print(f'unrecognized command-line parameter: {arg}')
+    print_help()
+
+def report_cli_unexpected(arg:str):
+    print(f'unexpected command-line parameter: {arg}')
+    print_help()
+
+def report_cli_expected(arg:str, actual:str):
+    print(f'expected command-line parameter for {arg}, but found {actual}.')
+    print_help()
+
+def handle_command_line() -> dict:
+    args = {
+        'silent': False,
+        'force': False,
+        'input_filepath': None,
+        'output_filepath': None,
+        'pycrules_filepath': os.path.join(os.path.dirname(__file__), 'default.pycrules'),
+        'debug': False,
+        'watch': None
+    }
+    skip_next = True
+    for argi,arg in enumerate(sys.argv):
+        if True == skip_next:
+            skip_next = False
+            continue
+        match arg:
+            case '--silent':
+                args['silent'] = True
+            case '--watch':
+                if len(sys.argv) <= argi:
+                    exit(4)
+                elif sys.argv[argi + 1].startswith('-'):
+                    report_cli_expected("WATCHDOG_COMMAND", sys.argv[argi + 1])
+                    exit(5)
+                args['watch'] = sys.argv[argi + 1]
+                skip_next = True
+            case '--force':
+                args['force'] = True
+            case '--help':
+                print_help()
+                exit(0)
+            case '--version':
+                exit(0)
+            case '--rules':
+                if len(sys.argv) <= argi:
+                    exit(4)
+                elif sys.argv[argi + 1].startswith('-'):
+                    report_cli_expected("RULES_FILE", sys.argv[argi + 1])
+                    exit(5)
+                args['pycrules_filepath'] = sys.argv[argi + 1]
+                skip_next = True
+            case '--debug':
+                if len(sys.argv) <= argi:
+                    exit(8)
+                elif sys.argv[argi + 1].startswith('-'):
+                    report_cli_expected("DEBUG_LEVEL", sys.argv[argi + 1])
+                    exit(9)
+                args['debug_level'] = sys.argv[argi + 1]
+                args['debug'] = True
+                _trace.set_level(int(args['debug_level']))
+                skip_next = True
+            case _:
+                if arg.startswith('-'):
+                    report_cli_unrecognized(arg)
+                elif None == args['input_filepath']:
+                    args['input_filepath'] = arg
+                elif None == args['output_filepath']:
+                    args['output_filepath'] = arg
+                else:
+                    report_cli_unexpected(arg)
+    if None == args['input_filepath']:
+        report_cli_expected('INPUT_FILE', 'no value')
+        exit(3)
+    elif None == args['output_filepath']:
+        report_cli_expected('OUTPUT_FILE', 'no value')
+        exit(4)
+    return args
+
+def load_pycrules_file(path:str):
+    name = 'pycrules'
+    if not os.path.isfile(path):
+        print(f'rules file not found: {path}')
+        exit(6)
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    sys.modules[name] = mod
+    return mod
+
+def write_result(path:str, output:bytearray):
+    with io.open(path, 'wb') as output_file:
+        output_file.write(output)
+        output_file.flush()
+
+class PYTYPE(IntEnum):
+    NULL = ord('0')
+    NONE = ord('N')
+    FALSE = ord('F')
+    TRUE = ord('T')
+    STOPITER = ord('S')
+    ELLIPSIS = ord('.')
+    INT = ord('i')
+    INT64 = ord('I') # obsolete
+    FLOAT = ord('f')
+    BINARY_FLOAT = ord('g')
+    COMPLEX = ord('x')
+    BINARY_COMPLEX = ord('y')
+    LONG = ord('l')
+    STRING = ord('s')
+    STRINGREF = ord('R')
+    INTERNED = ord('t')
+    REF = ord('r')
+    TUPLE = ord('(')
+    LIST = ord('[')
+    DICT = ord('{')
+    CODE = ord('c')
+    LEGACY_CODE = ord('C') # obsolete
+    UNICODE = ord('u')
+    UNKNOWN = ord('?') # compile-time only (should not appear in valid pyc)
+    SET = ord('<')
+    FROZENSET = ord('>')
+    FLAG_REF = ord('\x80') # bitmask, not a type code
+    ASCII = ord('a')
+    ASCII_INTERNED = ord('A')
+    SMALL_TUPLE = ord(')')
+    SHORT_ASCII = ord('z')
+    SHORT_ASCII_INTERNED = ord('Z')
+
+class PycMapper:
+    _cfg:dict
+    _mod:'PycModMapper'
+    _typecode:int
+    _offset:int
+    _size:int
+    def __init__(self, typecode:int, mod:'PycModMapper', offset:int):
+        self._typecode = typecode
+        self._cfg = mod.get_config()
+        self._mod = mod
+        self._offset = offset
+        self._size = 1
+    def __str__(self):
+        typecode_int:int = self.get_typecode()
+        typecode_str:str = self._cfg['pyc_typecode_lut'][typecode_int]
+        return f'{typecode_str}'
+    def get_offset(self) -> int:
+        return self._offset
+    def get_size(self) -> int:
+        return self._size
+    def get_typecode(self) -> PYTYPE:
+        return self._typecode & 0x7F
+    def read(self) -> 'PycMapper':
+        _trace.msg(f'PycMapper@{self._offset}')
+        return self
+
+class PycStringMapper(PycMapper):
+    _intern:'PycStringMapper' = None
+    _length:int = None
+    _value:str = None
+    def get_value(self):
+        if None != self._value:
+            return self._value
+        elif None != self._intern:
+            return self._intern.get_value()
+    def read(self) -> 'PycStringMapper':
+        _trace.msg(f'@{self._offset} PycStringMapper')
+        typecode = self.get_typecode()
+        input = self._mod.get_input()
+        rdi = self._offset + 1        
+        if PYTYPE.STRINGREF == typecode:
+            intern_index = int.from_bytes(input[rdi:rdi+4], 'little')
+            rdi += 4
+            self._intern = self._mod.get_intern(intern_index)
+            return self
+        if PYTYPE.SHORT_ASCII == typecode or PYTYPE.SHORT_ASCII_INTERNED == typecode:
+            self._length = input[rdi]
+            rdi += 1
+        else:
+            self._length = int.from_bytes(input[rdi:rdi+4], 'little')
+            rdi += 4
+        if 0 < self._length:
+            self._value = input[rdi:rdi+self._length]
+            rdi += self._length
+        else:
+            self._value = ''
+        if PYTYPE.INTERNED == typecode or PYTYPE.ASCII_INTERNED == typecode or PYTYPE.SHORT_ASCII_INTERNED == typecode:
+            self._mod.add_intern(self)
+        self._size = rdi - self._offset
+        # _trace.msg(f'{self.get_value()}')
+        return self
+
+class PycBinaryFloatMapper(PycMapper):
+    _value:float
+    def get_value(self) -> float:
+        return self._float
+    def read(self) -> 'PycBinaryFloatMapper':
+        _trace.msg(f'PycBinaryFloatMapper@{self._offset}')
+        input = self._mod.get_input()
+        rdi = self._offset + 1
+        float_size = 8
+        self._value = struct.unpack('d', input[rdi:rdi+float_size])[0]
+        rdi += float_size
+        self._size = rdi - self._offset
+        return self
+
+class PycBinaryComplexMapper(PycBinaryFloatMapper):
+    _imaginary:float
+    def read(self) -> 'PycBinaryComplexMapper':
+        _trace.msg(f'PycBinaryComplexMapper@{self._offset}')
+        super().read()
+        input = self._mod.get_input()
+        rdi = self._offset + self._size
+        float_size = 8
+        self._imaginary = struct.unpack('d', input[rdi:rdi+float_size])[0]
+        rdi += float_size
+        self._size = rdi - self._offset
+        return self
+
+class PycCodeMapper(PycMapper):
+    # https://formats.kaitai.io/python_pyc_27/python_pyc_27.svg
+    _argc:int
+    _pargc:int
+    _kwargc:int
+    _locc:int
+    _stac:int
+    _flags:int
+    _code:PycMapper
+    _const:PycMapper
+    _names:PycMapper
+    _lnames:PycMapper
+    _lkinds:PycMapper
+    _fvars:PycMapper
+    _cvars:PycMapper
+    _fname:PycMapper
+    _qname:PycMapper
+    _lno:int
+    _lntable:PycMapper
+    _excepts:PycMapper
+    def read(self) -> 'PycCodeMapper':
+        _trace.msg(f'PycCodeMapper@{self._offset}')
+        input = self._mod.get_input()
+        rdi = self._offset + 1
+        # _trace.msg('argc')
+        if self._mod.is_maxver(2,2):
+            self._argc = int.from_bytes(input[rdi:rdi+2], 'little')
+            rdi += 2
+        else:
+            self._argc = int.from_bytes(input[rdi:rdi+4], 'little')
+            rdi += 4
+        # _trace.msg('pargc')
+        if self._mod.is_minver(3,8):
+            self._pargc = int.from_bytes(input[rdi:rdi+4], 'little')
+            rdi += 4
+        # _trace.msg('kwargc')
+        if self._mod.is_minver(3,0):
+            self._kwargc = int.from_bytes(input[rdi:rdi+4], 'little')
+            rdi += 4
+        # _trace.msg('locc')
+        if self._mod.is_maxver(2,2):
+            self._locc = int.from_bytes(input[rdi:rdi+2], 'little')
+            rdi += 2
+        elif self._mod.is_maxver(3,10):
+            self._locc = int.from_bytes(input[rdi:rdi+4], 'little')
+            rdi += 4
+        # _trace.msg('stac')
+        if self._mod.is_maxver(2,2):
+            self._stac = int.from_bytes(input[rdi:rdi+2], 'little')
+            rdi += 2
+        else:
+            self._stac = int.from_bytes(input[rdi:rdi+4], 'little')
+            rdi += 4
+        # _trace.msg('flags')
+        if self._mod.is_maxver(2,2):
+            self._flags = int.from_bytes(input[rdi:rdi+2], 'little')
+            rdi += 2
+        else:
+            self._flags = int.from_bytes(input[rdi:rdi+4], 'little')
+            rdi += 4
+        reader = self._mod.get_reader()
+        
+        # _trace.msg('code')
+        self._code, incr = reader.read(rdi)
+        rdi += incr
+
+        self.deobfuscate(self._code)
+
+        # _trace.msg('const')
+        self._const, incr = reader.read(rdi)
+        rdi += incr
+        
+        # _trace.msg('names')
+        self._names, incr = reader.read(rdi)
+        rdi += incr
+
+        # _trace.msg('lnames')
+        if self._mod.is_minver(1,3):
+            self._lnames, incr = reader.read(rdi)
+            rdi += incr
+
+        # _trace.msg('lkinds')
+        if self._mod.is_minver(3,11):
+            self._lkinds, incr = reader.read(rdi)
+            rdi += incr
+
+        if self._mod.is_minver(2,1) and self._mod.is_maxver(3,10):
+            # _trace.msg('fvars')
+            self._fvars, incr = reader.read(rdi)
+            rdi += incr
+            # _trace.msg('cvars')
+            self._cvars, incr = reader.read(rdi)
+            rdi += incr
+
+        # _trace.msg('fname')
+        self._fname, incr = reader.read(rdi)
+        rdi += incr
+
+        # _trace.msg('name')
+        self._name, incr = reader.read(rdi)
+        rdi += incr
+
+        # _trace.msg('qname')
+        if self._mod.is_minver(3,11):
+            self._qname, incr = reader.read(rdi)
+            rdi += incr
+
+        # _trace.msg('lno')
+        if self._mod.is_minver(1,5) and self._mod.is_maxver(2,2):
+            self._lno = int.from_bytes(input[rdi:rdi+2])
+            rdi += 2
+        elif self._mod.is_minver(2,3):
+            self._lno = int.from_bytes(input[rdi:rdi+4])
+            rdi += 4
+
+        # _trace.msg('lntable')
+        if self._mod.is_minver(1,5):
+            self._lntable, incr = reader.read(rdi)
+            rdi += incr
+
+        # _trace.msg('excepts')
+        if self._mod.is_minver(3,11):
+            self._excepts, incr = reader.read(rdi)
+            rdi += incr
+        
+        self._size = rdi - self._offset
+        return self
+    def deobfuscate(self, code:'PycCodeMapper'):
+        if None == code:
+            return
+        input = self._mod.get_input()
+        output = self._mod.get_output()
+        offset = code.get_offset()
+        size = code.get_size()
+        rules = self._mod.get_config()['pyc_rules']
+        opcode_lut = self._mod.get_config()['pyc_opcode_lut']
+        opcode_remaps = self._mod.get_config()['pyc_opcode_remap']
+        opcode_size = rules.get_opcode_size()
+        opcode_dbg = f'SZ:{code.get_size()}; '
+        rdi = offset + 1 + 4
+        while rdi < (offset + size):
+            opcode = bytes(input[rdi:rdi+opcode_size])
+            opcode_i = int.from_bytes(opcode, 'little')
+            opcode_s = opcode_lut[opcode_i]
+            remap = opcode_remaps.get(opcode, None)
+            if None != remap:
+                remap_b:bytes = None
+                remap_i:int = None
+                remap_s:str = None
+                remap_incr:int = 2 if self._mod.is_minver(3,6) else 3 if 90 < opcode_i else 1
+                if type(remap) == dict:
+                    remap_b = remap['o']
+                    remap_i = int.from_bytes(remap['o'], 'little')
+                    remap_s = opcode_lut[remap_i]
+                    if None != remap['i']:
+                        remap_incr = remap['i']
+                elif type(remap) == bytes:
+                    remap_i = int.from_bytes(remap)
+                    remap_s = opcode_lut[remap_i]
+                    remap_b = remap
+                elif type(remap) == int:
+                    remap_i = remap
+                    remap_s = opcode_lut[remap_i]
+                    remap_b = remap.to_bytes(opcode_size, 'little')
+                output[rdi:rdi+opcode_size] = remap_b
+                # opcode_dbg += f'{opcode_s}/{opcode_i:02x}->\x1b[0;23m{remap_s}/{output[rdi]:02x}\x1b[3;2;37m'
+                opcode_dbg += f'\x1b[0;23m{remap_s}/{output[rdi]:02x}\x1b[3;2;37m'
+                if 1 < remap_incr:
+                    opcode_dbg += f'('
+                    for j in range(remap_incr-1):
+                        opcode_dbg += f'{input[rdi+1+j]:02x}'
+                    opcode_dbg += f') '
+                rdi += remap_incr
+            else:
+                opcode_dbg += f'{opcode_s}/{opcode_i:02x}'
+                if self._mod.is_minver(3,6):
+                    opcode_dbg += f'({input[rdi+1]:02x}) '
+                    rdi += 2
+                else:
+                    if 90 < opcode_i:
+                        opcode_dbg += f'({input[rdi+1]:02x}{input[rdi+2]:02x}) '
+                        rdi += 3
+                    else:
+                        opcode_dbg += f' '
+                        rdi += 1
+        _trace.msg(f'\x1b[3;2;37m{opcode_dbg}\x1b[0;23m', 1)
+        # if True == debug:
+        #     print('')
+
+class PycEllipsisMapper(PycMapper):
+    def read(self) -> 'PycEllipsisMapper':
+        _trace.msg(f'PycEllipsisMapper@{self._offset}')
+        return self
+
+class PycFalseMapper(PycMapper):
+    def get_value(self):
+        return False
+    def read(self) -> 'PycFalseMapper':
+        _trace.msg(f'PycFalseMapper@{self._offset}')
+        return self
+
+class PycFloatMapper(PycMapper):
+    _value:float
+    def get_value(self) -> float:
+        return self._float
+    def read(self) -> 'PycFloatMapper':
+        _trace.msg(f'PycFloatMapper@{self._offset}')
+        input = self._mod.get_input()
+        rdi = self._offset + 1
+        float_size = input[rdi]
+        rdi = self._offset + 1
+        if 4 == float_size:
+            self._value = struct.unpack('f', input[rdi:rdi+float_size])[0]
+        elif 8 == float_size:
+            self._value = struct.unpack('d', input[rdi:rdi+float_size])[0]
+        else:
+            print(f'WARN: unsupported float size `{float_size}` at position `{rdi}`, skipping.')
+        rdi += float_size
+        self._size = rdi - self._offset
+        return self
+
+class PycComplexMapper(PycFloatMapper):
+    _imaginary:float
+    def read(self) -> 'PycComplexMapper':
+        _trace.msg(f'PycComplexMapper@{self._offset}')
+        super().read()
+        input = self._mod.get_input()
+        rdi = self._size
+        float_size = input[rdi]
+        rdi = self._offset + 1
+        if 4 == float_size:
+            self._imaginary = struct.unpack('f', input[rdi:rdi+float_size])[0]
+        elif 8 == float_size:
+            self._imaginary = struct.unpack('d', input[rdi:rdi+float_size])[0]
+        else:
+            print(f'WARN: unsupported imaginary size `{float_size}` at position `{rdi}`, skipping.')
+        rdi += float_size
+        self._size = rdi - self._offset
+        return self
+
+class PycDictMapper(PycMapper):
+    _value:list
+    def get_value(self) -> list:
+        return self._value
+    def read(self) -> 'PycDictMapper':
+        _trace.msg(f'PycDictMapper@{self._offset}')
+        rdi = self._offset + 1
+        reader = self._mod.get_reader()
+        elements = []
+        while True:
+            k, incr = reader.read(rdi)
+            if isinstance(k, PycNullMapper):
+                break
+            rdi += incr
+            v, incr = reader.read(rdi)
+            rdi += incr
+            elements.append(tuple([k, v]))
+        self._value = elements
+        self._size = rdi - self._offset
+        return self
+
+class PycIntMapper(PycMapper):
+    _value:int
+    def get_value(self) -> int:
+        return self._value
+    def read(self) -> 'PycIntMapper':
+        _trace.msg(f'@{self._offset} PycIntMapper')
+        input = self._mod.get_input()
+        rdi = self._offset + 1
+        self._value = int.from_bytes(input[rdi:rdi+4], 'little')
+        rdi += 4
+        self._size = rdi - self._offset
+        return self
+
+class PycLongMapper(PycMapper):
+    _value:int
+    def get_value(self) -> int:
+        return self._value
+    def read(self) -> 'PycLongMapper':
+        typecode = self.get_typecode()
+        _trace.msg(f'@{self._offset} PycLongMapper [{typecode}/{self._mod.get_config()["pyc_typecode_lut"][typecode]}]')
+        input = self._mod.get_input()
+        rdi = self._offset + 1
+        match typecode:
+            case PYTYPE.INT64:
+                self._value = int.from_bytes(input[rdi:rdi+8], 'little')
+                rdi += 8
+                # print(f'@{self._offset} i8={self._value}')
+            case PYTYPE.LONG:
+                length_bytes = input[rdi:rdi+4]
+                if 0xF0 == (length_bytes[2] & 0xF0):
+                    signed = True
+                    int_size = abs(int.from_bytes(length_bytes, 'little', signed=signed))
+                else:
+                    signed = False
+                    int_size = int.from_bytes(length_bytes, 'little', signed=signed)
+                rdi += 4
+                int_size = int_size * 2
+                # print(f'@{self._offset} sz={int_size} signedness={signedness}')
+                if signed:
+                    self._value = int.from_bytes(input[rdi:rdi+int_size], 'little', signed=signed) * -1
+                else:
+                    self._value = int.from_bytes(input[rdi:rdi+int_size], 'little')
+                rdi += int_size
+                # print(f'@{self._offset} i{int_size}={self._value}')
+            case _:
+                print(f'unexpected type code: {typecode} at position {self._offset}')
+                exit(11)
+        self._size = rdi - self._offset
+        return self
+
+class PycListMapper(PycMapper):
+    _value:list
+    def get_value(self) -> list:
+        return self._value
+    def read(self) -> 'PycListMapper':
+        typecode = self.get_typecode()
+        _trace.msg(f'PycListMapper@{self._offset} [{typecode}/{self._mod.get_config()["pyc_typecode_lut"][typecode]}]')
+        input = self._mod.get_input()
+        rdi = self._offset + 1
+        element_count = int.from_bytes(input[rdi:rdi+4], 'little')
+        rdi += 4
+        reader = self._mod.get_reader()
+        elements = [None] * element_count
+        for i in range(element_count):
+            elements[i], incr = reader.read(rdi)
+            rdi += incr
+        self._value = elements
+        self._size = rdi - self._offset
+        return self
+
+class PycNoneMapper(PycMapper):
+    def get_value(self):
+        return None
+    def read(self) -> 'PycNoneMapper':
+        _trace.msg(f'PycNoneMapper@{self._offset}')
+        return self
+
+class PycNullMapper(PycMapper):
+    def get_value(self):
+        return None
+    def read(self) -> 'PycNullMapper':
+        _trace.msg(f'PycNullMapper@{self._offset}')
+        return self
+
+class PycSetMapper(PycListMapper):
+    def read(self) -> 'PycSetMapper':
+        super().read()
+        return self
+
+class PycStopIterMapper(PycMapper):
+    def read(self) -> 'PycStopIterMapper':
+        _trace.msg(f'PycStopIterMapper@{self._offset}')
+        return self
+
+class PycTrueMapper(PycMapper):
+    def get_value(self):
+        return True
+    def read(self) -> 'PycTrueMapper':
+        _trace.msg(f'PycTrueMapper@{self._offset}')
+        return self
+
+class PycTupleMapper(PycMapper):
+    _value:tuple
+    def get_value(self) -> tuple:
+        return self._value
+    def read(self) -> 'PycTupleMapper':
+        _trace.msg(f'PycTupleMapper@{self._offset}')
+        input = self._mod.get_input()
+        rdi = self._offset + 1
+        element_count:int = 0
+        if PYTYPE.SMALL_TUPLE == self.get_typecode():
+            element_count = input[rdi]
+            rdi += 1
+        else:
+            element_count = int.from_bytes(input[rdi:rdi+4], 'little')
+            rdi += 4
+        _trace.msg(f'element_count={element_count}')
+        reader = self._mod.get_reader()
+        elements = [None] * element_count
+        for i in range(element_count):
+            _trace.msg(f'i={i}')
+            elements[i], incr = reader.read(rdi)
+            rdi += incr
+        self._value = tuple(elements)
+        self._size = rdi - self._offset
+        return self
+
+class PycReader:
+    _cfg:dict
+    _pyc_typecode_remap:dict
+    _input:bytearray
+    _output:bytearray
+    _mod:'PycModMapper'
+    def __init__(self, mod:'PycModMapper'):
+        self._cfg = mod.get_config()
+        self._pyc_typecode_remap = self._cfg['pyc_typecode_remap']
+        self._input = mod.get_input()
+        self._output = mod.get_output()
+        self._mod = mod
+    def get_mapper(self, typecode:PYTYPE, offset:int) -> 'PycMapper':
+        rules = self._cfg['pyc_rules']
+        mapper = rules.get_subst_mapper(typecode, self._mod, offset)
+        if None != mapper:
+            return mapper
+        match typecode:
+            case PYTYPE.NULL:
+                _trace.msg('>> PYTYPE.NULL')
+                return PycNullMapper(typecode, self._mod, offset)
+            case PYTYPE.NONE:
+                _trace.msg('>> PYTYPE.NONE')
+                return PycNoneMapper(typecode, self._mod, offset)
+            case PYTYPE.FALSE:
+                _trace.msg('>> PYTYPE.FALSE')
+                return PycFalseMapper(typecode, self._mod, offset)
+            case PYTYPE.TRUE:
+                _trace.msg('>> PYTYPE.TRUE')
+                return PycTrueMapper(typecode, self._mod, offset)
+            case PYTYPE.STOPITER:
+                _trace.msg('>> PYTYPE.STOPITER')
+                return PycStopIterMapper(typecode, self._mod, offset)
+            case PYTYPE.ELLIPSIS:
+                _trace.msg('>> PYTYPE.ELLIPSIS')
+                return PycEllipsisMapper(typecode, self._mod, offset)
+            case PYTYPE.INT:
+                _trace.msg('>> PYTYPE.INT')
+                return PycIntMapper(typecode, self._mod, offset)
+            case PYTYPE.INT64:
+                _trace.msg('>> PYTYPE.INT64')
+                return PycLongMapper(typecode, self._mod, offset)
+            case PYTYPE.FLOAT:
+                _trace.msg('>> PYTYPE.FLOAT')
+                return PycFloatMapper(typecode, self._mod, offset)
+            case PYTYPE.BINARY_FLOAT:
+                _trace.msg('>> PYTYPE.BINARY_FLOAT')
+                return PycBinaryFloatMapper(typecode, self._mod, offset)
+            case PYTYPE.COMPLEX:
+                _trace.msg('>> PYTYPE.COMPLEX')
+                return PycComplexMapper(typecode, self._mod, offset)
+            case PYTYPE.BINARY_COMPLEX:
+                _trace.msg('>> PYTYPE.BINARY_COMPLEX')
+                return PycBinaryComplexMapper(typecode, self._mod, offset)
+            case PYTYPE.LONG:
+                _trace.msg('>> PYTYPE.LONG')
+                return PycLongMapper(typecode, self._mod, offset)
+            case PYTYPE.STRING:
+                _trace.msg('>> PYTYPE.STRING')
+                return PycStringMapper(typecode, self._mod, offset)
+            case PYTYPE.STRINGREF:
+                _trace.msg('>> PYTYPE.STRINGREF')
+                return PycStringMapper(typecode, self._mod, offset)
+            case PYTYPE.INTERNED:
+                _trace.msg('>> PYTYPE.INTERNED')
+                return PycStringMapper(typecode, self._mod, offset)
+            case PYTYPE.TUPLE:
+                _trace.msg('>> PYTYPE.TUPLE')
+                return PycTupleMapper(typecode, self._mod, offset)
+            case PYTYPE.LIST:
+                _trace.msg('>> PYTYPE.LIST')
+                return PycListMapper(typecode, self._mod, offset)
+            case PYTYPE.DICT:
+                _trace.msg('>> PYTYPE.DICT')
+                return PycDictMapper(typecode, self._mod, offset)
+            case PYTYPE.CODE:
+                _trace.msg('>> PYTYPE.CODE')
+                return PycCodeMapper(typecode, self._mod, offset)
+            case PYTYPE.LEGACY_CODE:
+                _trace.msg('>> PYTYPE.LEGACY_CODE')
+                return PycCodeMapper(typecode, self._mod, offset)
+            case PYTYPE.UNICODE:
+                _trace.msg('>> PYTYPE.UNICODE')
+                return PycStringMapper(typecode, self._mod, offset)
+            case PYTYPE.SET:
+                _trace.msg('>> PYTYPE.SET')
+                return PycSetMapper(typecode, self._mod, offset)
+            case PYTYPE.FROZENSET:
+                _trace.msg('>> PYTYPE.FROZENSET')
+                return PycSetMapper(typecode, self._mod, offset)
+            case PYTYPE.ASCII:
+                _trace.msg('>> PYTYPE.ASCII')
+                return PycStringMapper(typecode, self._mod, offset)
+            case PYTYPE.ASCII_INTERNED:
+                _trace.msg('>> PYTYPE.ASCII_INTERNED')
+                return PycStringMapper(typecode, self._mod, offset)
+            case PYTYPE.SMALL_TUPLE:
+                _trace.msg('>> PYTYPE.SMALL_TUPLE')
+                return PycTupleMapper(typecode, self._mod, offset)
+            case PYTYPE.SHORT_ASCII:
+                _trace.msg('>> PYTYPE.SHORT_ASCII')
+                return PycStringMapper(typecode, self._mod, offset)
+            case PYTYPE.SHORT_ASCII_INTERNED:
+                _trace.msg('>> PYTYPE.SHORT_ASCII_INTERNED')
+                return PycStringMapper(typecode, self._mod, offset)
+            case _:
+                _trace.msg(f'\x1b[1;31munexpected type code: {typecode} at position {offset}.\x1b[0m', 0)
+                exit(8)
+                #return PycMapper(0, self._mod, offset)
+    def read(self, offset:int) -> PycMapper:
+        _trace.down()
+        typecode = self._input[offset]
+        if typecode in self._pyc_typecode_remap:
+            typecode = self._pyc_typecode_remap[typecode].t
+            self._output[offset] = typecode
+        if PYTYPE.REF == typecode:
+            _trace.msg(f'>> PYTYPE.REF')
+            mapper_index = int.from_bytes(self._input[offset+1:offset+4], 'little')
+            result = self._mod.get_ref(mapper_index)
+            _trace.up()
+            return result, 5
+        else:
+            is_reference = PYTYPE.FLAG_REF == (PYTYPE.FLAG_REF & typecode)
+            typecode &= 0x7F
+            if typecode in self._pyc_typecode_remap:
+                typecode = self._pyc_typecode_remap[typecode].t
+                if is_reference:
+                    self._output[offset] = typecode | PYTYPE.FLAG_REF
+                else:
+                    self._output[offset] = typecode
+            mapper = self.get_mapper(typecode, offset)
+            if is_reference:
+                self._mod.add_ref(mapper)
+            result = mapper.read()
+            _trace.up()
+            return result, result.get_size()
+
+class PycModMapper:
+    _cfg:dict
+    _header:dict
+    _input:bytearray
+    _interns = []
+    _output:bytearray
+    _reader:PycReader
+    _refs = []
+    def __init__(self, cfg:dict, input:bytearray):
+        self._cfg = cfg
+        self._input = input
+        self._output = input.copy()
+        self._reader = PycReader(self)
+    def add_intern(self, mapper:PycMapper) -> None:
+        # _trace.msg(f'>> INTERN[{len(self._interns)}] = {mapper.get_typecode()}')
+        self._interns.append(mapper)
+    def add_ref(self, mapper:PycMapper) -> None:
+        # _trace.msg(f'>> REF[{len(self._refs)}] = {mapper.get_typecode()}')
+        self._refs.append(mapper)
+    def get_config(self) -> dict:
+        return self._cfg
+    def get_intern(self, index:int) -> PycMapper:
+        result = self._interns[index]
+        # _trace.msg(f'>> INTERN[{index}] -> {result.get_typecode()}')
+        return result
+    def get_ref(self, index:int) -> PycMapper:
+        result = self._refs[index]
+        # _trace.msg(f'>> REF[{index}] -> {result.get_typecode()}')
+        return result
+    def get_input(self) -> bytearray:
+        return self._input
+    def get_output(self) -> bytearray:
+        return self._output
+    def get_reader(self) -> PycReader:
+        return self._reader
+    def is_minver(self, ver_major:int, ver_minor:int) -> bool:
+        # _trace.msg(f"{self._header['version']} >= {(ver_major * 100) + ver_minor}")
+        return self._header['version'] >= (ver_major * 100) + ver_minor
+    def is_maxver(self, ver_major:int, ver_minor:int) -> bool:
+        # _trace.msg(f"{self._header['version']} <= {(ver_major * 100) + ver_minor}")
+        return self._header['version'] <= (ver_major * 100) + ver_minor
+    def read(self) -> PycMapper:
+        rules = self._cfg['pyc_rules']
+        if not rules.is_compatible(self._input):
+            print(f'input file `{self._cfg["args"]["input_filepath"]}` is not compatible with rules file `{self._cfg["args"]["pycrules_filepath"]}`.')
+            exit(7)
+        self._header = rules.inprocess(self._input, self._output)
+        offset = self._header['header_size']
+        _trace.msg(f'PycModMapper@{offset}', 1)
+        result, incr = self._reader.read(offset)
+        return result, incr
+    def write(self) -> None:
+        args = self._cfg['args']
+        rules = self._cfg['pyc_rules']
+        out_len = rules.outprocess(self._input, self._output)
+        pyc_output = self._output[0:out_len]
+        write_result(args['output_filepath'], pyc_output)
+
+def do_work(args:dict):
+    pyc_input = bytearray(os.path.getsize(args['input_filepath']))
+    input_file = io.open(args['input_filepath'], 'rb')
+    input_file.readinto(pyc_input)
+    input_file.close()
+
+    pycrules = load_pycrules_file(args['pycrules_filepath'])
+
+    pyc_typecode_map = pycrules.get_typecode_map()
+    pyc_typecode_lut = {}
+    pyc_typecode_remap = pycrules.get_typecode_remap()
+    for k in pyc_typecode_map:
+        v = pyc_typecode_map[k]
+        pyc_typecode_lut[v] = k
+    pyc_opcode_map = pycrules.get_opcode_map()
+    if None == pyc_opcode_map:
+        pyc_opcode_map = {}
+    pyc_opcode_lut = {}
+    for k in pyc_opcode_map:
+        v = pyc_opcode_map[k]
+        pyc_opcode_lut[v] = k
+    for opc in range(256):
+        if not opc in pyc_opcode_lut:
+            pyc_opcode_lut[opc] = f'<{opc}>'
+            pyc_opcode_map[f'<{opc}>'] = opc
+    pyc_opcode_remap = pycrules.get_opcode_remap()
+
+    cfg = {
+        'args': args,
+        'pyc_rules': pycrules,
+        'pyc_typecode_map': pyc_typecode_map,
+        'pyc_typecode_lut': pyc_typecode_lut,
+        'pyc_typecode_remap': pyc_typecode_remap,
+        'pyc_opcode_map': pyc_opcode_map,
+        'pyc_opcode_lut': pyc_opcode_lut,
+        'pyc_opcode_remap': pyc_opcode_remap
+    }
+
+    mod = PycModMapper(cfg, pyc_input)
+    obj = mod.read()
+    # succes, write the result
+    mod.write()
+
+def do_watch(args:dict):
+    import time
+    import subprocess
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    class ChangeHandler(FileSystemEventHandler):
+        def on_modified(self, event):
+            do_work(args)
+            subprocess.run(args['watch'])
+    event_handler = ChangeHandler()
+    observer = Observer()
+    observer.schedule(event_handler, args['pycrules_filepath'])
+    observer.start()
+    print(f'.. waiting for changes: {args["pycrules_filepath"]}')
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
+
+def main():
+    args = handle_command_line()
+    if True != args['silent']:
+        print_version()
+    if not os.path.isfile(args['input_filepath']):
+        print(f'missing input file: {args["input_filepath"]}')
+        exit(1)
+    if os.path.isfile(args['output_filepath']):
+        if not args['force']:
+            print(f'output file already exists: {args["output_filepath"]}')
+            exit(2)
+    if None == args['watch']:
+        do_work(args)
+    else:
+        do_watch(args)
+
+main()
